@@ -16,7 +16,7 @@ NETWORKS = ""
 LEASE_DURATION = "86400"
 
 # 默认网关 IP，留空使用 10.46.0.1。
-GATEWAY = "10.10.0.1"
+GATEWAY = "10.0.0.1"
 
 # 页面中服务端节点的名称，留空显示"服务器"。
 # GATEWAY_NAME = "服务器"
