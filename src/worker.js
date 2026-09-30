@@ -31,7 +31,7 @@ export default {
       }
 
       // 302 跳转到项目地址
-      return Response.redirect("https://github.com/lmq8267/vnts2-cf", 302);
+      return Response.redirect("", 302);
     } catch (error) {
       console.error("[vnts2-cf] Worker 请求处理失败", error);
       return Response.json({ ok: false, error: "服务暂时不可用" }, { status: 503 });
