@@ -24,8 +24,6 @@ const MAX_MESSAGE_BYTES = 1024 * 1024;
 const MAX_SESSIONS = 1024;
 const MAX_NETWORKS = 1024;
 const MAX_STORED_DEVICES = 4096;
-const MAX_PEER_ROUTES = 5;
-const PEER_ROUTE_REFRESH_MS = 5000;
 
 export class Vnts2Room {
   constructor(state, env) {
@@ -55,8 +53,6 @@ export class Vnts2Room {
     this.peerClientCacheTime = 0;
     this.peerClientCacheSignature = "";
     this.peerServerStatus = new Map();
-    this.peerLatencyCache = new Map();
-    this.peerLatencyCacheTime = 0;
     this.logLevel = String(env.LOG_LEVEL || "info").toLowerCase();
     this.maintenanceIntervalMs = positiveSeconds(env.MAINTENANCE_INTERVAL, 15, 5) * 1000;
     this.logs = [];
@@ -66,8 +62,6 @@ export class Vnts2Room {
     this.startTime = Date.now();
     this._dataDirty = false;
     this._logPersistScheduled = false;
-    this._pendingNetworkCleanup = new Set();
-    this._peerRefreshInflight = false;
   }
 
   async fetch(request) {
@@ -131,7 +125,6 @@ export class Vnts2Room {
   async alarm() {
     try {
       await this.cleanupExpired();
-      await this.flushPendingNetworkCleanup();
       await this.refreshPeerClientCache(true);
       this.pingLocalClients();
     } catch (error) {
@@ -219,9 +212,7 @@ export class Vnts2Room {
       if (!net.devices.has(reg.deviceId) && this.totalDeviceCount() >= MAX_STORED_DEVICES) throw new Error("服务端设备数量已达到上限");
       allocation = this.allocateIp(net, cfg, reg, session.id);
     } catch (error) {
-      // 借鉴 Rust 版：注册路径不再同步删除网络，把空网络清理挪到 alarm 后台执行，
-      // 避免高并发注册时网络反复创建/删除导致 dataVersion 抖动
-      if (isNewNetwork && !net.devices.size) this.markNetworkForCleanup(reg.networkCode);
+      if (isNewNetwork && !net.devices.size) this.networks.delete(reg.networkCode);
       throw error;
     }
     const { ip, device } = allocation;
@@ -339,7 +330,7 @@ export class Vnts2Room {
       }
       const copy = new Uint8Array(bytes);
       if (!decrementTtl(copy)) return;
-      this.schedulePeerClientRefresh();
+      if (this.peerServers.length) await this.refreshPeerClientCache();
       if (!this.forwardToIp(net, packet.destId, copy)) await this.forwardToPeers(session.networkCode, packet.destId, copy);
     } else if (packet.msgType === MSG.BROADCAST) {
       if (this.disableRelay) {
@@ -379,7 +370,7 @@ export class Vnts2Room {
         const view = new DataView(packet.payload.buffer, packet.payload.byteOffset, packet.payload.byteLength);
         const time = Number(view.getBigUint64(0, false));
         const dataVersion = Number(view.getBigUint64(8, false));
-        this.schedulePeerClientRefresh();
+        await this.refreshPeerClientCache();
         const changed = this.changedClientSimpleList(session, dataVersion, time);
         if (changed) this.send(session, makePacket(MSG.PUSH_CLIENT_IPS, encodeClientSimpleInfoList(changed), { gateway: true, ttl: 1 }));
         else {
@@ -398,7 +389,7 @@ export class Vnts2Room {
     } else if (packet.msgType === MSG.RPC_REQ) {
       const req = parseRpcRequest(packet.payload);
       if (!req.clientListReq) return;
-      this.schedulePeerClientRefresh();
+      await this.refreshPeerClientCache();
       const payload = encodeRpcClientListResponse(req.id, this.clientInfoList(session));
       this.send(session, makePacket(MSG.RPC_RES, payload, { gateway: true, ttl: 1 }));
     }
@@ -585,15 +576,7 @@ export class Vnts2Room {
       body: encodeServerMessage({ forwardData: { networkCode, data: bytes } }),
       signal: AbortSignal.timeout(15000)
     };
-    // 按 peer 到客户端总延迟排序，取 top MAX_PEER_ROUTES
-    const remoteClients = this.sortedRemoteClients(networkCode);
-    const peerLatency = new Map(remoteClients.map((c) => [c.remotePeer, c.peerLatencyMs || 0]));
-    const peerOrder = [...this.peerServers].sort(
-      (a, b) => (peerLatency.get(a) ?? this.peerLatencyCache.get(a) ?? 10000) -
-                (peerLatency.get(b) ?? this.peerLatencyCache.get(b) ?? 10000)
-    );
-    const peers = peerOrder.slice(0, MAX_PEER_ROUTES);
-    for (const peer of peers) {
+    for (const peer of this.peerServers) {
       try {
         const url = `${peer}/peer/message`;
         const res = await fetch(url, init);
@@ -602,7 +585,6 @@ export class Vnts2Room {
           const peerDelivered = !!body.authRes?.success;
           delivered = delivered || peerDelivered;
           this.logDebug(`互联 protobuf 转发发送 网络编号=${networkCode} 目标=${intToIp(dest)} 节点=${peer} 已投递=${peerDelivered}`);
-          if (delivered) break;
         }
       } catch (error) {
         this.logInfo(`互联转发失败 网络=${networkCode} 目标=${intToIp(dest)} 节点=${peer} 原因=${error.message || String(error)}`);
@@ -611,31 +593,16 @@ export class Vnts2Room {
     return delivered;
   }
 
-  schedulePeerClientRefresh() {
-    if (!this.peerServers.length || !this.peerToken) return;
-    const now = Date.now();
-    if (now - this.peerClientCacheTime < PEER_ROUTE_REFRESH_MS) return;
-    if (this._peerRefreshInflight) return;
-    this.peerClientCacheTime = now;
-    this._peerRefreshInflight = true;
-    this.refreshPeerClientCache(true).finally(() => {
-      this._peerRefreshInflight = false;
-    });
-  }
-
   async refreshPeerClientCache(force = false) {
     if (!this.peerServers.length || !this.peerToken) return;
     const now = Date.now();
-    if (!force && now - this.peerClientCacheTime < PEER_ROUTE_REFRESH_MS) return;
+    if (!force && now - this.peerClientCacheTime < 5000) return;
     const next = new Map();
-    const latencyMap = new Map();
     const networkCodes = Array.from(this.networks.keys());
     const newPeerStatus = new Map();
     for (const peer of this.peerServers) {
       let online = false;
-      let latencyMs = 10000;
       try {
-        const t0 = Date.now();
         const res = await fetch(`${peer}/peer/message`, {
           method: "POST",
           headers: {
@@ -646,7 +613,6 @@ export class Vnts2Room {
           body: encodeServerMessage({ clientInfoReq: { networkCodes } }),
           signal: AbortSignal.timeout(15000)
         });
-        latencyMs = Math.max(0, Date.now() - t0);
         if (!res.ok) continue;
         online = true;
         const body = parseServerMessage(await readResponseBytes(res));
@@ -654,20 +620,16 @@ export class Vnts2Room {
           if (!isNetworkAllowed(this.allowedNetworks, network.networkCode)) continue;
           const list = next.get(network.networkCode) || [];
           for (const client of network.clients || []) {
-            list.push({ ip: client.ip >>> 0, latencyMs: client.latencyMs || 10, online: true, remotePeer: peer, peerLatencyMs: latencyMs });
+            list.push({ ip: client.ip >>> 0, latencyMs: client.latencyMs || 10, online: true, remotePeer: peer });
           }
           next.set(network.networkCode, list);
         }
       } catch (error) {
-        latencyMs = 10000;
         this.logInfo(`互联客户端列表刷新失败 节点=${peer} 原因=${error.message || String(error)}`);
       }
       newPeerStatus.set(peer, online);
-      latencyMap.set(peer, online ? latencyMs : 10000);
     }
     this.peerServerStatus = newPeerStatus;
-    this.peerLatencyCache = latencyMap;
-    this.peerLatencyCacheTime = now;
     const signature = JSON.stringify(Array.from(next.entries()).map(([code, list]) => [code, list.map((c) => [c.ip, c.online, c.dataVersion || 0, c.remotePeer]).sort()]).sort());
     if (signature !== this.peerClientCacheSignature) {
       for (const code of next.keys()) {
@@ -680,18 +642,6 @@ export class Vnts2Room {
     }
     this.peerClientCache = next;
     this.peerClientCacheTime = now;
-  }
-
-  sortedRemoteClients(networkCode) {
-    const clients = this.remoteClients(networkCode);
-    if (!clients.length) return [];
-    return clients
-      .map((client) => ({
-        ...client,
-        totalLatency: (client.latencyMs || 0) + (client.peerLatencyMs || 0)
-      }))
-      .sort((a, b) => a.totalLatency - b.totalLatency)
-      .slice(0, MAX_PEER_ROUTES);
   }
 
   remoteClients(networkCode) {
@@ -800,29 +750,6 @@ export class Vnts2Room {
     if (deletedDevices || deletedNetworks) {
       this.logDebug(`过期清理 删除设备=${deletedDevices} 删除网络=${deletedNetworks}`);
     }
-  }
-
-  markNetworkForCleanup(networkCode) {
-    this._pendingNetworkCleanup.add(networkCode);
-    this.logDebug(`网络清理入队 网络编号=${networkCode}`);
-  }
-
-  async flushPendingNetworkCleanup() {
-    if (!this._pendingNetworkCleanup.size) return;
-    const codes = Array.from(this._pendingNetworkCleanup);
-    this._pendingNetworkCleanup.clear();
-    let flushed = 0;
-    for (const code of codes) {
-      const net = this.networks.get(code);
-      // 只在仍为空时才真正删除，避免误删后来已有设备的网络
-      if (net && !net.devices.size && !this.remoteClients(code).length) {
-        this.networks.delete(code);
-        this._dataDirty = true;
-        flushed++;
-        this.logDebug(`后台删除空网络 网络编号=${code}`);
-      }
-    }
-    if (flushed) this.logDebug(`后台网络清理完成 数量=${flushed}`);
   }
 
   totalDeviceCount() {
